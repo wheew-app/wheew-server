@@ -1,0 +1,393 @@
+"use strict";
+var __decorate = (this && this.__decorate) || function (decorators, target, key, desc) {
+    var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;
+    if (typeof Reflect === "object" && typeof Reflect.decorate === "function") r = Reflect.decorate(decorators, target, key, desc);
+    else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+    return c > 3 && r && Object.defineProperty(target, key, r), r;
+};
+var __metadata = (this && this.__metadata) || function (k, v) {
+    if (typeof Reflect === "object" && typeof Reflect.metadata === "function") return Reflect.metadata(k, v);
+};
+var UserDocumentService_1;
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.UserDocumentService = void 0;
+const common_1 = require("@nestjs/common");
+const prisma_service_1 = require("../../prisma/prisma.service");
+const notification_dispatcher_service_1 = require("../../notification/services/notification-dispatcher.service");
+let UserDocumentService = class UserDocumentService {
+    static { UserDocumentService_1 = this; }
+    prismaService;
+    notificationDispatcherService;
+    logger = new common_1.Logger(UserDocumentService_1.name);
+    EXPIRY_WARNING_DAYS = 30;
+    static EXPIRY_NOTIFICATION_THRESHOLDS = [1, 7, 15];
+    constructor(prismaService, notificationDispatcherService) {
+        this.prismaService = prismaService;
+        this.notificationDispatcherService = notificationDispatcherService;
+    }
+    async uploadDocument(userId, uploadDto) {
+        const user = await this.prismaService.user.findUnique({
+            where: { id: userId },
+        });
+        if (!user) {
+            throw new common_1.NotFoundException('User not found');
+        }
+        if (uploadDto.document_type) {
+            const existingDocument = await this.prismaService.userDocument.findFirst({
+                where: {
+                    user_id: userId,
+                    document_type: uploadDto.document_type,
+                },
+            });
+            if (existingDocument) {
+                throw new common_1.BadRequestException(`You already have a ${uploadDto.document_type} document. Please update or delete it first.`);
+            }
+        }
+        const expiryDate = this.resolveExpiryDate(uploadDto.document_type, uploadDto.expiry_date);
+        const uniqueId = uploadDto.unique_id;
+        const document = await this.prismaService.userDocument.create({
+            data: {
+                user_id: userId,
+                unique_id: uniqueId,
+                document_type: uploadDto.document_type,
+                document_url: uploadDto.document_url || null,
+                expiry_date: expiryDate,
+            },
+        });
+        if (uploadDto.document_type === 'VEHICLE_OWNERSHIP') {
+            await this.prismaService.user.update({
+                where: { id: userId },
+                data: { is_vehicle_ownership_document_submitted: true },
+            });
+        }
+        const uploaderName = user.nick_name || user.name || 'A user';
+        this.notificationDispatcherService.dispatchAdminNotification('New Document Uploaded', `${uploaderName} uploaded a new ${document.document_type ?? 'user'} document for verification.`, { documentId: document.id, userId }).catch((err) => {
+            this.logger.error(`Failed to notify admins of document upload: ${err.message}`);
+        });
+        return this.formatDocumentResponse(document);
+    }
+    async getUserDocuments(userId) {
+        const user = await this.prismaService.user.findUnique({
+            where: { id: userId },
+        });
+        if (!user) {
+            throw new common_1.NotFoundException('User not found');
+        }
+        const documents = await this.prismaService.userDocument.findMany({
+            where: { user_id: userId },
+            orderBy: { expiry_date: 'asc' },
+        });
+        return documents.map((doc) => this.formatDocumentResponse(doc));
+    }
+    async getUserDocumentExpirySummaries(userId) {
+        const documents = await this.prismaService.userDocument.findMany({
+            where: { user_id: userId },
+            select: {
+                document_type: true,
+                expiry_date: true,
+            },
+            orderBy: { expiry_date: 'asc' },
+        });
+        return documents.map((document) => ({
+            document_type: document.document_type,
+            daysUntilExpiry: this.getDaysUntilExpiry(document.expiry_date),
+        }));
+    }
+    async getDocumentById(documentId, userId) {
+        const document = await this.prismaService.userDocument.findUnique({
+            where: { id: documentId },
+        });
+        if (!document) {
+            throw new common_1.NotFoundException('Document not found');
+        }
+        if (document.user_id !== userId) {
+            throw new common_1.BadRequestException('You do not have permission to access this document');
+        }
+        return this.formatDocumentResponse(document);
+    }
+    async getDocumentByType(userId, documentType) {
+        const document = await this.prismaService.userDocument.findFirst({
+            where: {
+                user_id: userId,
+                document_type: documentType,
+            },
+        });
+        if (!document) {
+            throw new common_1.NotFoundException(`No ${documentType} document found`);
+        }
+        return this.formatDocumentResponse(document);
+    }
+    async updateDocument(documentId, userId, updateDto) {
+        const document = await this.prismaService.userDocument.findUnique({
+            where: { id: documentId },
+        });
+        if (!document) {
+            throw new common_1.NotFoundException('Document not found');
+        }
+        if (document.user_id !== userId) {
+            throw new common_1.BadRequestException('You do not have permission to update this document');
+        }
+        const updateData = {};
+        if (updateDto.unique_id !== undefined) {
+            updateData.unique_id = updateDto.unique_id;
+        }
+        if (updateDto.document_type) {
+            updateData.document_type = updateDto.document_type;
+        }
+        const documentType = updateDto.document_type ?? document.document_type;
+        if (documentType === 'VEHICLE_OWNERSHIP') {
+            updateData.expiry_date = null;
+        }
+        else if (updateDto.expiry_date) {
+            updateData.expiry_date = this.resolveExpiryDate(documentType, updateDto.expiry_date);
+        }
+        if ('expiry_date' in updateData) {
+            updateData.last_expiry_notified_days = null;
+            updateData.expired_notified_at = null;
+        }
+        if (updateDto.document_url !== undefined) {
+            updateData.document_url = updateDto.document_url || null;
+        }
+        if (Object.keys(updateData).length === 0) {
+            return this.formatDocumentResponse(document);
+        }
+        const updatedDocument = await this.prismaService.userDocument.update({
+            where: { id: documentId },
+            data: updateData,
+        });
+        const owner = await this.prismaService.user.findUnique({ where: { id: userId } });
+        const ownerName = owner?.nick_name || owner?.name || 'A user';
+        this.notificationDispatcherService.dispatchAdminNotification('Document Updated', `${ownerName} updated their ${updatedDocument.document_type ?? 'user'} document.`, { documentId, userId }).catch((err) => {
+            this.logger.error(`Failed to notify admins of document update: ${err.message}`);
+        });
+        return this.formatDocumentResponse(updatedDocument);
+    }
+    async deleteDocument(documentId, userId) {
+        const document = await this.prismaService.userDocument.findUnique({
+            where: { id: documentId },
+        });
+        if (!document) {
+            throw new common_1.NotFoundException('Document not found');
+        }
+        if (document.user_id !== userId) {
+            throw new common_1.BadRequestException('You do not have permission to delete this document');
+        }
+        await this.prismaService.userDocument.delete({
+            where: { id: documentId },
+        });
+        if (document.document_type === 'VEHICLE_OWNERSHIP') {
+            const updateData = { is_vehicle_ownership_document_submitted: false };
+            if (document.is_verified) {
+                updateData.is_vehicle_verified = false;
+            }
+            await this.prismaService.user.update({
+                where: { id: document.user_id },
+                data: updateData,
+            });
+        }
+        return { message: 'Document deleted successfully' };
+    }
+    async getDocumentExpiryWarnings(userId) {
+        const documents = await this.prismaService.userDocument.findMany({
+            where: { user_id: userId },
+            orderBy: { expiry_date: 'asc' },
+        });
+        const now = new Date();
+        const warningDate = new Date();
+        warningDate.setDate(warningDate.getDate() + this.EXPIRY_WARNING_DAYS);
+        const expiringDocuments = documents.filter((doc) => {
+            const expiryDate = doc.expiry_date;
+            const isExpiring = expiryDate !== null && expiryDate <= warningDate && expiryDate > now;
+            return isExpiring;
+        });
+        const expiredDocuments = documents.filter((doc) => {
+            const expiryDate = doc.expiry_date;
+            return expiryDate !== null && expiryDate <= now;
+        });
+        return {
+            expiredDocuments: expiredDocuments.map((doc) => this.formatDocumentResponse(doc)),
+            expiringDocuments: expiringDocuments.map((doc) => this.formatDocumentResponse(doc)),
+        };
+    }
+    async getAllExpiringDocuments(daysThreshold = Math.max(...UserDocumentService_1.EXPIRY_NOTIFICATION_THRESHOLDS)) {
+        const now = new Date();
+        const warningDate = new Date();
+        warningDate.setDate(warningDate.getDate() + daysThreshold);
+        const expiringDocuments = await this.prismaService.userDocument.findMany({
+            where: {
+                expiry_date: {
+                    lte: warningDate,
+                    gt: now,
+                },
+            },
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        fcm_token: true,
+                        nick_name: true,
+                        email: true,
+                    },
+                },
+            },
+            orderBy: { expiry_date: 'asc' },
+        });
+        return expiringDocuments;
+    }
+    async getAllExpiredDocuments() {
+        const now = new Date();
+        const expiredDocuments = await this.prismaService.userDocument.findMany({
+            where: {
+                expiry_date: {
+                    lt: now,
+                },
+                expired_notified_at: null,
+            },
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        fcm_token: true,
+                        nick_name: true,
+                        email: true,
+                    },
+                },
+            },
+            orderBy: { expiry_date: 'asc' },
+        });
+        return expiredDocuments;
+    }
+    async getAllUserDocumentsForAdmin(userId) {
+        const whereClause = {};
+        if (userId) {
+            const user = await this.prismaService.user.findUnique({
+                where: { id: userId },
+            });
+            if (!user) {
+                throw new common_1.NotFoundException('User not found');
+            }
+            whereClause.user_id = userId;
+        }
+        const documents = await this.prismaService.userDocument.findMany({
+            where: whereClause,
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        nick_name: true,
+                        email: true,
+                    },
+                },
+            },
+            orderBy: [{ user_id: 'asc' }, { expiry_date: 'asc' }],
+        });
+        return documents.map((doc) => ({
+            id: doc.id,
+            user_id: doc.user_id,
+            unique_id: doc.unique_id,
+            document_type: doc.document_type,
+            document_url: doc.document_url,
+            expiry_date: doc.expiry_date,
+            is_verified: doc.is_verified,
+            isExpired: this.isDocumentExpired(doc.expiry_date),
+            daysUntilExpiry: this.getDaysUntilExpiry(doc.expiry_date),
+            createdAt: doc.createdAt,
+            updatedAt: doc.updatedAt,
+            user: doc.user,
+        }));
+    }
+    resolveExpiryDate(documentType, expiryDate) {
+        if (documentType === 'VEHICLE_OWNERSHIP') {
+            return null;
+        }
+        if (!expiryDate) {
+            return null;
+        }
+        const parsedExpiryDate = new Date(expiryDate);
+        if (Number.isNaN(parsedExpiryDate.getTime())) {
+            throw new common_1.BadRequestException('Document expiry date is invalid');
+        }
+        if (parsedExpiryDate <= new Date()) {
+            throw new common_1.BadRequestException('Document expiry date must be in the future');
+        }
+        return parsedExpiryDate;
+    }
+    getDaysUntilExpiry(expiryDate) {
+        if (!expiryDate) {
+            return -1;
+        }
+        const now = new Date();
+        const diffTime = expiryDate.getTime() - now.getTime();
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        return diffDays;
+    }
+    isDocumentExpired(expiryDate) {
+        if (!expiryDate) {
+            return false;
+        }
+        return expiryDate <= new Date();
+    }
+    async verifyDocument(documentId, isVerified) {
+        const document = await this.prismaService.userDocument.findUnique({
+            where: { id: documentId },
+            include: { user: true },
+        });
+        if (!document) {
+            throw new common_1.NotFoundException('Document not found');
+        }
+        if (isVerified && document.document_type === 'VEHICLE_OWNERSHIP') {
+            if (!document.user.licence_id) {
+                throw new common_1.BadRequestException('User has no license ID in their profile to match');
+            }
+            const documentUniqueId = document.unique_id?.trim().toLowerCase();
+            if (!documentUniqueId) {
+                throw new common_1.BadRequestException('Document unique ID is missing');
+            }
+            if (document.user.licence_id.trim().toLowerCase() !== documentUniqueId) {
+                throw new common_1.BadRequestException(`Verification failed: License plate in profile (${document.user.licence_id}) does not match the document unique ID (${document.unique_id})`);
+            }
+        }
+        const updatedDocument = await this.prismaService.userDocument.update({
+            where: { id: documentId },
+            data: { is_verified: isVerified },
+        });
+        if (document.document_type === 'VEHICLE_OWNERSHIP') {
+            await this.prismaService.user.update({
+                where: { id: document.user_id },
+                data: { is_vehicle_verified: isVerified },
+            });
+        }
+        const statusText = isVerified ? 'verified' : 'rejected';
+        const message = isVerified
+            ? `Your ${document.document_type} document has been verified successfully.`
+            : `Your ${document.document_type} document verification failed/was rejected.`;
+        this.notificationDispatcherService.dispatchSystemNotification([document.user_id], `Document Verification ${isVerified ? 'Success' : 'Failed'}`, message, { documentId, documentType: document.document_type, status: statusText }).catch((err) => {
+            this.logger.error(`Failed to dispatch document verification notification to user ${document.user_id}: ${err.message}`);
+        });
+        return this.formatDocumentResponse(updatedDocument);
+    }
+    formatDocumentResponse(document) {
+        const daysUntilExpiry = this.getDaysUntilExpiry(document.expiry_date);
+        const isExpired = this.isDocumentExpired(document.expiry_date);
+        return {
+            id: document.id,
+            user_id: document.user_id,
+            unique_id: document.unique_id,
+            document_type: document.document_type,
+            document_url: document.document_url,
+            expiry_date: document.expiry_date,
+            is_verified: document.is_verified,
+            isExpired,
+            daysUntilExpiry,
+            createdAt: document.createdAt,
+            updatedAt: document.updatedAt,
+        };
+    }
+};
+exports.UserDocumentService = UserDocumentService;
+exports.UserDocumentService = UserDocumentService = UserDocumentService_1 = __decorate([
+    (0, common_1.Injectable)(),
+    __metadata("design:paramtypes", [prisma_service_1.PrismaService,
+        notification_dispatcher_service_1.NotificationDispatcherService])
+], UserDocumentService);
+//# sourceMappingURL=user-document.service.js.map

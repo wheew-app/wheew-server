@@ -1,0 +1,830 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider      = "prisma-client"
+  output        = "../generated/prisma"
+  moduleFormat  = "cjs"
+  binaryTargets = ["native", "rhel-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String  @id @default(auto()) @map("_id") @db.ObjectId
+  avatar    String?
+  fcm_token String?
+
+  email                    String      @unique
+  name                     String?
+  licence_id               String?
+  nick_name                String      @unique
+  password                 String?
+  auth_provider            AuthProvider @default(PASSWORD)
+  firebase_uid             String?
+  google_sub               String?
+  apple_sub                String?
+  is_more_options_accepted Boolean     @default(false)
+  designation              String?
+  gender                   Gender?
+  birth_year               Int?
+  is_blocked               Boolean     @default(false)
+  is_deleted               Boolean     @default(false)
+  email_verified           Boolean     @default(false)
+  license_no_verified      Boolean     @default(false)
+  account_type             AccountType @default(FREE)
+  qr_code                  String?
+
+  vehicle_type                            VehicleType?
+  vehicle_model                           String?
+  vehicle_color                           String?
+  is_vehicle_verified                     Boolean      @default(false)
+  is_vehicle_ownership_document_submitted Boolean      @default(false)
+
+  country String?
+  city    String?
+
+  otp                    String?
+  otp_expires            DateTime?
+  otp_verification_token String?
+
+  role UserRole @default(USER)
+
+  chatRooms_user1  ChatRoom[]  @relation("user1")
+  chatRooms_user2  ChatRoom[]  @relation("user2")
+  blockLists       BlockList[] @relation("user")
+  blockListsBy     BlockList[] @relation("blocked_user")
+  sentMessages     Chat[]      @relation("sender")
+  receivedMessages Chat[]      @relation("receiver")
+
+  groupChatRooms      GroupChatRoomMember[]
+  groupChats          GroupChat[]           @relation("sender")
+  userRatingsGiven    UserRating[]          @relation("rater")
+  userRatingsReceived UserRating[]          @relation("ratee")
+  parkingReports      ParkingReport[]
+  documents           UserDocument[]
+  supportTickets      SupportTicket[]
+  parkRelayReputation ParkRelayReputation?
+
+  notificationEvents         NotificationEvent[]
+  notificationPreference     NotificationPreference?
+  userLocation               UserLocation?
+  savedParkingLocations      SavedParkingLocation[]
+  paidParkingPrompts         PaidParkingPrompt[]
+  parkingNotificationCredits ParkingNotificationCredit[]
+
+  // Parking notification credit system
+  // First notification is free, then credits are earned by submitting parking reports
+  parking_notifications_available Int @default(1)
+  parking_reports_submitted       Int @default(0)
+
+  deviceKeys UserDeviceKey[]
+  parkingAreaRatings ParkingAreaRating[]
+
+  lastSeenAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([firebase_uid])
+  @@index([google_sub])
+  @@index([apple_sub])
+  @@map("users")
+}
+
+model ChatRoom {
+  id         String  @id @default(auto()) @map("_id") @db.ObjectId
+  is_deleted Boolean @default(false)
+  user1_id   String  @db.ObjectId
+  user2_id   String  @db.ObjectId
+
+  user1 User @relation("user1", fields: [user1_id], references: [id], onDelete: Cascade)
+  user2 User @relation("user2", fields: [user2_id], references: [id], onDelete: Cascade)
+
+  chats Chat[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([user1_id, user2_id])
+  @@map("chat_rooms")
+}
+
+model GroupChatRoom {
+  id                  String                @id @default(auto()) @map("_id") @db.ObjectId
+  name                String
+  image               String?
+  is_deleted          Boolean               @default(false)
+  group_members_count Int                   @default(0)
+  members             GroupChatRoomMember[]
+
+  chats GroupChat[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("group_chat_rooms")
+}
+
+model GroupChatRoomMember {
+  id                   String    @id @default(auto()) @map("_id") @db.ObjectId
+  groupChatRoom_id     String    @db.ObjectId
+  user_id              String    @db.ObjectId
+  last_read_message_id String?   @db.ObjectId
+  group_role           GroupRole @default(GROUP_MEMBER)
+
+  groupChatRoom GroupChatRoom @relation(fields: [groupChatRoom_id], references: [id], onDelete: Cascade)
+  user          User          @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([groupChatRoom_id, user_id])
+  @@map("group_chat_room_members")
+}
+
+model GroupChat {
+  id               String      @id @default(auto()) @map("_id") @db.ObjectId
+  groupChatRoom_id String      @db.ObjectId
+  sender_id        String      @db.ObjectId
+  message          String
+  type             MessageType @default(TEXT)
+  encryptionType   String?
+  encryptionVersion Int?
+  senderKeyId      String?     @db.ObjectId
+  nonce            String?
+  encryptedKeys    Json?
+  file_url         String?
+  file_name        String?
+  file_size        Int?
+  file_mime_type   String?
+  durationSeconds  Int?
+  waveform         Json?
+  isDeletedForEveryone Boolean @default(false)
+  deletedAt        DateTime?
+  deletedById      String?     @db.ObjectId
+
+  groupChatRoom GroupChatRoom @relation(fields: [groupChatRoom_id], references: [id], onDelete: Cascade)
+  sender        User          @relation(fields: [sender_id], references: [id], onDelete: Cascade, name: "sender")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("group_chats")
+}
+
+model Chat {
+  id             String      @id @default(auto()) @map("_id") @db.ObjectId
+  chatRoom_id    String      @db.ObjectId
+  sender_id      String      @db.ObjectId
+  receiver_id    String      @db.ObjectId
+  message        String
+  type           MessageType @default(TEXT)
+  encryptionType String?
+  encryptionVersion Int?
+  senderKeyId    String?     @db.ObjectId
+  receiverKeyId  String?     @db.ObjectId
+  nonce          String?
+  is_read        Boolean     @default(false)
+  is_delivered   Boolean     @default(false)
+  file_url       String?
+  file_name      String?
+  file_size      Int?
+  file_mime_type String?
+  durationSeconds Int?
+  waveform       Json?
+  isDeletedForEveryone Boolean @default(false)
+  deletedAt      DateTime?
+  deletedById    String?     @db.ObjectId
+
+  chatRoom ChatRoom @relation(fields: [chatRoom_id], references: [id], onDelete: Cascade)
+  sender   User     @relation("sender", fields: [sender_id], references: [id], onDelete: Cascade)
+  receiver User     @relation("receiver", fields: [receiver_id], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("chats")
+}
+
+model PresetMessage {
+  id         String            @id @default(auto()) @map("_id") @db.ObjectId
+  message    String
+  message_it String
+  type       PresetMessageType @default(CLASSIC)
+  isActive   Boolean           @default(true)
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+
+  @@map("preset_messages")
+}
+
+model MessageRequest {
+  id           String               @id @default(auto()) @map("_id") @db.ObjectId
+  senderId     String               @db.ObjectId
+  receiverId   String               @db.ObjectId
+  roomId       String?              @db.ObjectId
+  firstMessage String?
+  presetMessageId String?           @db.ObjectId
+  status       MessageRequestStatus @default(PENDING)
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+
+  @@unique([senderId, receiverId])
+  @@index([receiverId])
+  @@index([status])
+  @@map("message_requests")
+}
+
+model UsefullNumber {
+  id          String               @id @default(auto()) @map("_id") @db.ObjectId
+  title       String
+  description String?
+  phone       String
+  category    UsefulNumberCategory @default(EMERGENCY_CONTACT)
+  icon        String?
+  sortOrder   Int                  @default(0)
+  isActive    Boolean              @default(true)
+  location    location?
+  geolocation geolocation?
+  createdAt   DateTime             @default(now())
+  updatedAt   DateTime             @updatedAt
+
+  @@index([category])
+  @@index([isActive])
+  @@map("useful_numbers")
+}
+
+type location {
+  latitude  Float
+  longitude Float
+}
+
+type geolocation {
+  type        String
+  coordinates Float[]
+}
+
+model UserRating {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  rater_id String       @db.ObjectId
+  ratee_id String       @db.ObjectId
+  rating   Int
+  review   String?
+  status   RatingStatus @default(PENDING)
+
+  rater User @relation("rater", fields: [rater_id], references: [id], onDelete: Cascade)
+  ratee User @relation("ratee", fields: [ratee_id], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([rater_id, ratee_id])
+  @@map("user_ratings")
+}
+
+model BlockList {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  user_id         String @db.ObjectId
+  blocked_user_id String @db.ObjectId
+
+  user         User @relation("user", fields: [user_id], references: [id], onDelete: Cascade)
+  blocked_user User @relation("blocked_user", fields: [blocked_user_id], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([user_id, blocked_user_id])
+  @@map("block_list")
+}
+
+model SitePolicy {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  type PolicyType
+
+  content String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("site_policy")
+}
+
+enum MessageType {
+  TEXT
+  FILE
+  VOICE
+}
+
+enum PresetMessageType {
+  ALERT
+  CLASSIC
+}
+
+enum MessageRequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+
+enum UsefulNumberCategory {
+  EMERGENCY_CONTACT
+  VEHICLE_ASSISTANCE
+  TRAFFIC_AND_PARKING
+}
+
+model UserDeviceKey {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deviceId  String
+  publicKey String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, deviceId])
+  @@index([userId])
+  @@map("user_device_keys")
+}
+
+model Point {
+  id          String  @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  description String?
+  latitude    Float
+  longitude   Float
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("points")
+}
+
+model BlackListedWord {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  word String @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("blacklisted_words")
+}
+
+model Faq {
+  id          String @id @default(auto()) @map("_id") @db.ObjectId
+  title       String
+  description String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([createdAt])
+  @@map("faqs")
+}
+
+model ParkingReport {
+  id                         String                    @id @default(auto()) @map("_id") @db.ObjectId
+  user_id                    String                    @db.ObjectId
+  user                       User                      @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  latitude                   Float
+  longitude                  Float
+  parking_cost               ParkingCost
+  electric_charging          Boolean
+  disabled_facility          Boolean
+  disabled_facility_location DisabledFacilityLocation?
+  is_active                  Boolean                   @default(true)
+  createdAt                  DateTime                  @default(now())
+  expiresAt                  DateTime?
+  spotId                     String?                   @db.ObjectId
+  spot                       ParkingSpot?              @relation(fields: [spotId], references: [id])
+  updatedAt                  DateTime                  @updatedAt
+
+  @@map("parking_reports")
+}
+
+model ParkingSpot {
+  id                         String                    @id @default(auto()) @map("_id") @db.ObjectId
+  latitude                   Float
+  longitude                  Float
+  parking_cost               ParkingCost
+  electric_charging          Boolean
+  disabled_facility          Boolean
+  disabled_facility_location DisabledFacilityLocation?
+  is_active                  Boolean                   @default(true)
+  available                  Boolean                   @default(true)
+  createdAt                  DateTime                  @default(now())
+  reports                    ParkingReport[]
+}
+
+model ParkingNotificationCredit {
+  id String @id @default(auto()) @map("_id") @db.ObjectId
+
+  user_id String @db.ObjectId
+  user    User   @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  parking_report_id String @db.ObjectId
+
+  // Transaction type: earned (from submitting a report) or consumed (from receiving a notification)
+  transaction_type TransactionType
+
+  // 1 credit earned or -1 credit consumed
+  amount Int
+
+  // Running balance after this transaction
+  balance Int
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("parking_notification_credits")
+}
+
+model ParkingHandoff {
+  id          String        @id @default(auto()) @map("_id") @db.ObjectId
+  releaserId  String        @db.ObjectId
+  seekerId    String?       @db.ObjectId
+  spotId      String?       @db.ObjectId
+  latitude    Float
+  longitude   Float
+  approxLatitude  Float?
+  approxLongitude Float?
+  status      HandoffStatus @default(AVAILABLE)
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  cancelledAt DateTime?
+  foundAt     DateTime?
+  occupiedAt  DateTime?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([releaserId])
+  @@index([seekerId])
+  @@index([status])
+  @@index([expiresAt])
+  @@map("parking_handoffs")
+}
+
+model ParkingSearchSession {
+  id        String              @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String              @unique @db.ObjectId
+  latitude  Float
+  longitude Float
+  accuracy  Float?
+  status    ParkingSearchStatus @default(SEARCHING)
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+
+  @@index([status])
+  @@map("parking_search_sessions")
+}
+
+model SavedParkingLocation {
+  id         String            @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String            @db.ObjectId
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name       String?
+  spotId     String?           @db.ObjectId
+  parkingArea ParkingArea?      @relation(fields: [spotId], references: [id])
+  latitude   Float
+  longitude  Float
+  accuracy   Float?
+  confidence Float?
+  source     ParkingSaveSource @default(MANUAL)
+  note       String?
+  photoUrl   String?
+  isActive   Boolean           @default(true)
+  parkingType ParkingCost?
+  paidExpiresAt DateTime?
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+
+  @@index([userId])
+  @@index([userId, isActive])
+  @@index([spotId])
+  @@map("saved_parking_locations")
+}
+
+model ParkingSession {
+  id                  String               @id @default(auto()) @map("_id") @db.ObjectId
+  userId              String               @db.ObjectId
+  spotId              String?              @db.ObjectId
+  latitude            Float
+  longitude           Float
+  costType            ParkingCost
+  durationMin         Int?
+  expiresAt           DateTime?
+  expiryWarningSentAt DateTime?
+  status              ParkingSessionStatus @default(ACTIVE)
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([expiresAt])
+  @@map("parking_sessions")
+}
+
+model PaidParkingPrompt {
+  id        String                  @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String                  @db.ObjectId
+  user      User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  savedParkingLocationId String     @db.ObjectId
+  status    PaidParkingPromptStatus @default(PENDING)
+  answeredAt DateTime?
+  createdAt DateTime                @default(now())
+  updatedAt DateTime                @updatedAt
+
+  @@index([userId, status])
+  @@map("paid_parking_prompts")
+}
+
+model ParkRelayReputation {
+  id                 String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId             String   @unique @db.ObjectId
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  successfulHandoffs Int      @default(0)
+  occupiedReports    Int      @default(0)
+  cancelledHandoffs  Int      @default(0)
+  expiredHandoffs    Int      @default(0)
+  score              Float    @default(0)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@map("park_relay_reputations")
+}
+
+model ParkingArea {
+  id                       String                     @id @default(auto()) @map("_id") @db.ObjectId
+  name                     String?
+  description              String?
+  centerLat                Float
+  centerLng                Float
+  polygon                  Json?
+  parkingCost              ParkingCost?
+  parkingFee               Float?
+  parkingAreaTypes         ParkingAreaType[]          @default([])
+  disabledFacilityLocation DisabledFacilityLocation?
+  totalSpots               Int?
+  isActive                 Boolean                    @default(true)
+  createdById              String                     @db.ObjectId
+  createdAt                DateTime                   @default(now())
+  updatedAt                DateTime                   @updatedAt
+  rating                   Float?
+  reviewCount              Int                        @default(0)
+  ratings                  ParkingAreaRating[]
+  savedParkingLocations    SavedParkingLocation[]
+
+  @@index([isActive])
+  @@index([isActive, centerLat, centerLng])
+  @@map("parking_areas")
+}
+
+model ParkingAreaRating {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  parkingAreaId String   @db.ObjectId
+  userId        String   @db.ObjectId
+  rating        Int
+  review        String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  parkingArea ParkingArea @relation(fields: [parkingAreaId], references: [id], onDelete: Cascade)
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([parkingAreaId, userId])
+  @@map("parking_area_ratings")
+}
+
+enum TransactionType {
+  EARNED
+  CONSUMED
+}
+
+enum HandoffStatus {
+  AVAILABLE
+  ACCEPTED
+  FOUND
+  CANCELLED
+  EXPIRED
+  OCCUPIED
+}
+
+enum ParkingSearchStatus {
+  IDLE
+  SEARCHING
+  PARKED
+}
+
+enum ParkingSaveSource {
+  AUTO
+  MANUAL
+}
+
+enum PaidParkingPromptStatus {
+  PENDING
+  ANSWERED
+  DISMISSED
+}
+
+enum ParkingSessionStatus {
+  ACTIVE
+  EXPIRED
+  LEFT
+}
+
+enum JobType {
+  SendWelcomeEmail
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  PREFER_NOT_TO_SAY
+}
+
+enum PolicyType {
+  PrivacyPolicy
+  Terms
+  More
+}
+
+enum GroupRole {
+  GROUP_ADMIN
+  GROUP_MEMBER
+}
+
+enum RatingStatus {
+  PUBLISHED
+  REJECTED
+  PENDING
+}
+
+enum AccountType {
+  FREE
+  PREMIUM
+}
+
+enum AuthProvider {
+  PASSWORD
+  GOOGLE
+  APPLE
+}
+
+enum ParkingCost {
+  FREE
+  PAID
+}
+enum ParkingAreaType {
+  ELECTRIC_CHARGING
+  DISABLED_FACILITY
+}
+
+enum DisabledFacilityLocation {
+  BACK
+  RIGHT
+  LEFT
+  NONE
+  ALL
+}
+
+enum NotificationEventType {
+  PARKING_AVAILABLE
+  PARKING_NEARBY
+  CHAT_MESSAGE
+  CHAT_DELIVERED
+  CHAT_READ
+  RATING_RECEIVED
+  GROUP_CHAT_MESSAGE
+  GROUP_CHAT_ADDED
+  GROUP_CHAT_REMOVED
+  SYSTEM_NOTIFICATION
+  USER_MENTION
+  PARKING_EXPIRING_SOON
+  DOCUMENT_EXPIRING_SOON
+  DOCUMENT_EXPIRED
+}
+
+model NotificationEvent {
+  id     String @id @default(auto()) @map("_id") @db.ObjectId
+  userId String @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  eventType NotificationEventType
+  title     String
+  message   String
+  payload   String?
+
+  isRead Boolean   @default(false)
+  sentAt DateTime  @default(now())
+  readAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([eventType])
+  @@index([isRead])
+  @@index([createdAt])
+  @@map("notification_events")
+}
+
+model NotificationPreference {
+  id     String @id @default(auto()) @map("_id") @db.ObjectId
+  userId String @unique @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  parkingNotifications   Boolean @default(true)
+  chatNotifications      Boolean @default(true)
+  ratingNotifications    Boolean @default(true)
+  groupChatNotifications Boolean @default(true)
+  systemNotifications    Boolean @default(true)
+
+  notificationRadius Int @default(200)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("notification_preferences")
+}
+
+model UserLocation {
+  id     String @id @default(auto()) @map("_id") @db.ObjectId
+  userId String @unique @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  latitude  Float
+  longitude Float
+  accuracy  Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("user_locations")
+}
+
+model UserDocument {
+  id            String       @id @default(auto()) @map("_id") @db.ObjectId
+  user_id       String       @db.ObjectId
+  user          User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  unique_id     String?
+  expiry_date   DateTime?
+  document_type DocumentType?
+  document_url  String?
+  is_verified   Boolean      @default(false)
+
+  last_expiry_notified_days Int?
+  expired_notified_at       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("user_documents")
+}
+
+enum DocumentType {
+  LICENSE
+  INSURANCE
+  TAX
+  VEHICLE_OWNERSHIP
+  CAR_INSPECTION
+}
+
+enum VehicleType {
+  CAR
+  MOTORCYCLE
+  VAN
+  SUV
+  TRUCK
+  CAMPER
+  SCOOTER
+  PICKUP
+  MICRO_CAR
+  CITY_CAR
+  E_SCOOTER
+  OTHER
+}
+
+model SupportTicket {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId      String   @db.ObjectId
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subject     String
+  description String
+  adminReply  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("support_tickets")
+}

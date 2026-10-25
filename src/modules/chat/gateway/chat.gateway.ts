@@ -1,0 +1,750 @@
+import { Injectable, UseFilters, UsePipes, ValidationPipe } from "@nestjs/common";
+import { ConnectedSocket, MessageBody, OnGatewayConnection, OnGatewayDisconnect, OnGatewayInit, SubscribeMessage, WebSocketGateway, WebSocketServer, WsException } from "@nestjs/websockets";
+import { Server, Socket } from "socket.io";
+import { ChatService } from "../chat.service";
+import { GroupChatService } from "src/modules/group-chat/group-chat.service";
+import { EMIT_EVENTS, SUBSCRIBED_EVENTS } from "../enums/events.enum";
+import { SendMessageDto } from "../dtos/send-message.dto";
+import { UserService } from "src/modules/user/user.service";
+import { plainToInstance } from "class-transformer";
+import { AllMessageDto } from "../dtos/all-message.dto";
+import { GetAllMessagesDto } from "../dtos/get-all-messages.dto";
+import { GetUserRoomsDto } from "../dtos/get-user-rooms.dto";
+import { AllUserRoomsDto } from "../dtos/all-user-rooms.dto";
+import { MessageAcknowledgementDto } from "../dtos/message-acknowledgement.dto";
+import { WsExceptionsFilter } from "src/common/exceptions/WsExceptionHandler";
+import { CreateGroupChatRoomDto } from "src/modules/group-chat/dtos/create-group-chat-room.dto";
+import { SendGroupMessageDto } from "src/modules/group-chat/dtos/send-group-message.dto";
+import { UpdateGroupChatRoomDto } from "src/modules/group-chat/dtos/update-group-chat-room.dto";
+import { AddGroupMembersDto } from "src/modules/group-chat/dtos/add-group-members.dto";
+import { PaginationDto } from "src/modules/group-chat/dtos/pagination.dto";
+import { SocketRoomService } from "../services/socket-room.service";
+import { MongoIdValidationPipe } from "src/common/pipes/mongo-id-validation.pipe";
+import { isValidMongoId } from "src/common/utils/mongo-id.util";
+
+
+@WebSocketGateway({
+    cors: {
+        origin: "http://10.10.20.44:3000"
+    }
+})
+@UsePipes(
+    new MongoIdValidationPipe(),
+    new ValidationPipe({
+        transform: true,
+        whitelist: true,
+    }),
+)
+@UseFilters(WsExceptionsFilter)
+@Injectable()
+export class SocketGateway implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect {
+
+    @WebSocketServer()
+    server: Server
+
+    private userTypingStates: Map<string, Set<string>> = new Map() // Track typing users per group
+    private typingTimeouts: Map<string, NodeJS.Timeout> = new Map()
+
+    constructor(
+        private readonly chatService: ChatService,
+        private readonly userService: UserService,
+        private readonly groupChatService: GroupChatService,
+        private readonly socketRoomService: SocketRoomService,
+        // private readonly server: Server
+    ) { }
+
+    /**
+     * Initialize gateway and set server on SocketRoomService
+     */
+    afterInit(server: Server) {
+        this.socketRoomService.setServer(server);
+    }
+
+    /**
+     * Generate Socket.IO room ID for a group chat
+     * @param groupChatRoomId The ID of the group chat room
+     * @returns Formatted room ID string
+     */
+    private generateGroupRoomId(groupChatRoomId: string | number): string {
+        return `group-${groupChatRoomId}`
+    }
+
+    /**
+     * Generate Socket.IO room ID for a user
+     * @param userId The ID of the user
+     * @returns Formatted room ID string
+     */
+    private generateUserRoomId(userId: string | number): string {
+        return `user-${userId}`
+    }
+
+    private clearTypingTimeout(key: string) {
+        const timeout = this.typingTimeouts.get(key)
+        if (timeout) {
+            clearTimeout(timeout)
+            this.typingTimeouts.delete(key)
+        }
+    }
+
+    private setTypingTimeout(key: string, onExpire: () => void) {
+        this.clearTypingTimeout(key)
+        const timeout = setTimeout(() => {
+            this.typingTimeouts.delete(key)
+            onExpire()
+        }, 5000)
+        timeout.unref?.()
+        this.typingTimeouts.set(key, timeout)
+    }
+
+    async handleDisconnect(client: Socket) {
+        console.log(`client disconnected: ${client.id}`)
+
+        const userId = client.data.userId
+
+        if (userId) {
+            console.log(`User ${userId} disconnected.`)
+            const isOffline = this.socketRoomService.markUserDisconnected(userId, client.id)
+
+            this.userTypingStates.forEach((typingUsers, groupChatRoomId) => {
+                if (typingUsers.delete(userId)) {
+                    this.server.to(this.generateGroupRoomId(groupChatRoomId)).emit(EMIT_EVENTS.GROUP_USER_STOPPED_TYPING, {
+                        userId,
+                        groupChatRoomId
+                    })
+                }
+                if (typingUsers.size === 0) {
+                    this.userTypingStates.delete(groupChatRoomId)
+                }
+            })
+
+            if (isOffline) {
+                const lastSeen = await this.userService.updateLastSeenAt(userId).catch((err) => {
+                    console.error(`Failed to update lastSeenAt for user ${userId}:`, err)
+                    return null
+                })
+
+                this.server.emit(EMIT_EVENTS.USER_OFFLINE, {
+                    userId,
+                    isOnline: false,
+                    lastSeenAt: lastSeen?.lastSeenAt ?? new Date()
+                })
+            }
+        }
+    }
+
+
+    async handleConnection(client: Socket, ...args: any[]) {
+        console.log(`client connected: ${client.id}`)
+
+        try {
+            const userId = client.handshake.query.userId as string
+
+            if (!userId) {
+                client.emit(EMIT_EVENTS.ERROR, { message: "userId is required" })
+                client.disconnect()
+                return
+            }
+
+            if (!isValidMongoId(userId)) {
+                client.emit(EMIT_EVENTS.ERROR, { message: "userId must be a valid MongoDB ObjectId" })
+                client.disconnect()
+                return
+            }
+
+            const user = await this.userService.findUserById(userId)
+
+            if (!user) {
+                client.emit(EMIT_EVENTS.ERROR, { message: "User not found" })
+                client.disconnect()
+                return
+            }
+
+            // Join user to their personal room
+            client.join(this.generateUserRoomId(userId))
+            const wasOffline = this.socketRoomService.markUserConnected(userId, client.id)
+
+            client.data.userId = userId
+
+            if (wasOffline) {
+                this.server.emit(EMIT_EVENTS.USER_ONLINE, {
+                    userId,
+                    isOnline: true,
+                    lastSeenAt: null
+                })
+            }
+
+            client.emit(EMIT_EVENTS.SUCCESS, { message: "User Successfully Connected With Socket" })
+
+        } catch (err: any) {
+            console.log(`Socket connection error for client ${client.id}:`, err)
+            client.emit(EMIT_EVENTS.ERROR, { message: err.message ?? "Connection failed" })
+            client.disconnect()
+        }
+    }
+
+
+
+
+    @SubscribeMessage("greeting")
+    handleMessage(@MessageBody() data: any, @ConnectedSocket() client: Socket) {
+
+    }
+
+    /**
+     * INDIVIDUAL CHAT HANDLERS
+     */
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.MESSAGE)
+    async handleChat(@MessageBody() data: SendMessageDto, @ConnectedSocket() client: Socket) {
+        try {
+
+            const userId = client.data.userId
+
+            const chat = await this.chatService.createMessage(userId, data)
+
+            if ((chat as any).isMessageRequest) {
+                this.server.to(this.generateUserRoomId(data.receiver_id)).emit(EMIT_EVENTS.MESSAGE_REQUEST, (chat as any).request)
+                this.server.to(this.generateUserRoomId(userId)).emit(EMIT_EVENTS.MESSAGE_REQUEST_SENT, (chat as any).request)
+                return
+            }
+
+            // Send to receiver
+            this.server.to(this.generateUserRoomId(data.receiver_id)).emit(EMIT_EVENTS.NEW_MESSAGE, { ...chat, is_mine: false })
+
+            // Send confirmation to sender
+            this.server.to(this.generateUserRoomId(userId)).emit(EMIT_EVENTS.MESSAGE_SENT, { ...chat, is_mine: true })
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+
+    }
+
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.MESSAGE_RECEIVED)
+    async handleMesssageDelivery(@MessageBody() acknowledgements: MessageAcknowledgementDto, @ConnectedSocket() client: Socket) {
+        console.log("message received", acknowledgements)
+        try {
+            if (acknowledgements && Array.isArray(acknowledgements.messageIds)) {
+                acknowledgements.messageIds.forEach(async (messageId) => {
+                    try {
+                        const chat = await this.chatService.acknowledgeMessageDelivery(messageId)
+                        if (chat) {
+                            // Notify sender that message was delivered
+                            this.server.to(this.generateUserRoomId(chat.sender_id)).emit(EMIT_EVENTS.MESSAGE_DELIVERED, chat)
+                        }
+                        
+                    } catch (innerErr: any) {
+                        console.error(`Error acknowledging message ${messageId}:`, innerErr);
+                    }
+                })
+            }
+        } catch (err: any) {
+            console.error('Error in handleMesssageDelivery:', err);
+            throw new WsException({ message: err.message });
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.TYPING)
+    async handleTyping(
+        @MessageBody() data: { receiverId: string; roomId: string },
+        @ConnectedSocket() client: Socket
+    ) {
+        try {
+            const userId = client.data.userId
+            await this.chatService.ensureUserCanTypeInRoom(userId, data.roomId, data.receiverId)
+
+            const user = await this.userService.findUserById(userId)
+            const payload = {
+                senderId: userId,
+                receiverId: data.receiverId,
+                roomId: data.roomId,
+                user: user ? {
+                    id: user.id,
+                    nick_name: user.nick_name,
+                    avatar: user.avatar
+                } : null
+            }
+
+            this.server.to(this.generateUserRoomId(data.receiverId)).emit(EMIT_EVENTS.USER_TYPING, payload)
+
+            const typingKey = `one-to-one-${data.roomId}-${userId}`
+            this.setTypingTimeout(typingKey, () => {
+                this.server.to(this.generateUserRoomId(data.receiverId)).emit(EMIT_EVENTS.USER_STOPPED_TYPING, {
+                    senderId: userId,
+                    receiverId: data.receiverId,
+                    roomId: data.roomId
+                })
+            })
+        } catch (err: any) {
+            console.error('Error in handleTyping:', err);
+            throw new WsException({ message: err.message });
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.STOP_TYPING)
+    async handleStopTyping(
+        @MessageBody() data: { receiverId: string; roomId: string },
+        @ConnectedSocket() client: Socket
+    ) {
+        try {
+            const userId = client.data.userId
+            await this.chatService.ensureUserCanTypeInRoom(userId, data.roomId, data.receiverId)
+
+            const typingKey = `one-to-one-${data.roomId}-${userId}`
+            this.clearTypingTimeout(typingKey)
+
+            this.server.to(this.generateUserRoomId(data.receiverId)).emit(EMIT_EVENTS.USER_STOPPED_TYPING, {
+                senderId: userId,
+                receiverId: data.receiverId,
+                roomId: data.roomId
+            })
+        } catch (err: any) {
+            console.error('Error in handleStopTyping:', err);
+            throw new WsException({ message: err.message });
+        }
+    }
+
+
+    // File messages are sent via HTTP POST /chat/message/file
+    // The socket events (new-message / message-sent) are emitted
+    // from ChatService.sendFileMessage() using SocketRoomService.
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.FETCH_CHAT_ROOMS)
+    async getAllUserRooms(@MessageBody() getUserRoomsDto: GetUserRoomsDto, @ConnectedSocket() client: Socket) {
+        try {
+            const userId = client.data.userId
+
+            const rooms = await this.chatService.getUserChatRooms(userId, getUserRoomsDto)
+            console.log(rooms)
+
+            this.server.to(this.generateUserRoomId(userId)).emit(EMIT_EVENTS.ALL_CHAT_ROOMS, rooms)
+        } catch (err: any) {
+            console.error('Error in getAllUserRooms:', err);
+            throw new WsException({ message: err.message });
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.FETCH_MESSAGES)
+    async getAllRoomMessages(@MessageBody() getAllMessageDto: GetAllMessagesDto, @ConnectedSocket() client: Socket) {
+        try {
+            const userId = client.data.userId
+
+            console.log(getAllMessageDto)
+
+            const messages = await this.chatService.getRoomMessages(userId, getAllMessageDto)
+
+            const messageDto = plainToInstance(AllMessageDto, messages, {
+                excludeExtraneousValues: true
+            })
+
+            this.server.to(this.generateUserRoomId(userId)).emit(EMIT_EVENTS.ALL_MESSAGES, {
+                ...messageDto
+            })
+        } catch (err: any) {
+            console.error('Error in getAllRoomMessages:', err);
+            throw new WsException({ message: err.message });
+        }
+    }
+
+    /**
+     * GROUP CHAT HANDLERS
+     */
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.CREATE_GROUP_CHAT)
+    async handleCreateGroupChat(@MessageBody() data: CreateGroupChatRoomDto, @ConnectedSocket() client: Socket) {
+        try {
+            const userId = client.data.userId
+
+            const groupChat = await this.groupChatService.createGroupChatRoom(userId, data)
+
+            // Join creator to group room
+            const groupRoomId = this.generateGroupRoomId(groupChat.id)
+            client.join(groupRoomId)
+
+            // Notify all group members
+            groupChat.members.forEach(member => {
+                this.server.to(this.generateUserRoomId(member.user_id)).emit(EMIT_EVENTS.SUCCESS, {
+                    message: `You've been added to group: ${groupChat.name}`,
+                    groupChat
+                })
+            })
+
+            client.emit(EMIT_EVENTS.SUCCESS, {
+                message: "Group chat created successfully",
+                groupChat
+            })
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.SEND_GROUP_MESSAGE)
+    async handleSendGroupMessage(@MessageBody() data: SendGroupMessageDto, @ConnectedSocket() client: Socket) {
+        try {
+            const userId = client.data.userId
+
+            const message = await this.groupChatService.sendGroupMessage(userId, data)
+
+            const groupRoomId = this.generateGroupRoomId(data.groupChatRoomId)
+
+            // Broadcast to all group members except sender
+            client.broadcast.to(groupRoomId).emit(EMIT_EVENTS.GROUP_NEW_MESSAGE, {
+                ...message,
+                groupChatRoomId: data.groupChatRoomId,
+                is_mine: false
+            })
+
+            // Confirm to sender
+            client.emit(EMIT_EVENTS.GROUP_MESSAGE_SENT, {
+                ...message,
+                is_mine: true
+            })
+
+            // Stop typing indicator
+            this.userTypingStates.get(data.groupChatRoomId)?.delete(userId)
+            this.clearTypingTimeout(`group-${data.groupChatRoomId}-${userId}`)
+            client.broadcast.to(groupRoomId).emit(EMIT_EVENTS.GROUP_USER_STOPPED_TYPING, {
+                userId,
+                groupChatRoomId: data.groupChatRoomId
+            })
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.JOIN_GROUP_CHAT)
+    async handleJoinGroupChat(@MessageBody() data: { groupChatRoomId: string }, @ConnectedSocket() client: Socket) {
+        try {
+            const userId = client.data.userId
+            const groupRoomId = this.generateGroupRoomId(data.groupChatRoomId)
+
+            client.join(groupRoomId)
+
+            // Notify all members that user joined
+            this.server.to(groupRoomId).emit(EMIT_EVENTS.SUCCESS, {
+                message: `User ${userId} joined the group`,
+                userId,
+                groupChatRoomId: data.groupChatRoomId
+            })
+
+            client.emit(EMIT_EVENTS.SUCCESS, {
+                message: "Successfully joined group chat"
+            })
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.LEAVE_GROUP_CHAT)
+    async handleLeaveGroupChat(@MessageBody() data: { groupChatRoomId: string }, @ConnectedSocket() client: Socket) {
+        try {
+            const userId = client.data.userId
+            const groupRoomId = this.generateGroupRoomId(data.groupChatRoomId)
+
+            // Call service to update database and handle admin reassignment if needed
+            const result = await this.groupChatService.leaveGroup(data.groupChatRoomId, userId)
+
+            // Remove user from socket room
+            client.leave(groupRoomId)
+
+            // Notify remaining members that user left
+            this.server.to(groupRoomId).emit(EMIT_EVENTS.GROUP_MEMBER_REMOVED, {
+                message: `User ${userId} left the group`,
+                userId,
+                groupChatRoomId: data.groupChatRoomId
+            })
+
+            client.emit(EMIT_EVENTS.SUCCESS, {
+                message: result.message || "Successfully left group chat"
+            })
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.FETCH_GROUP_CHAT_ROOMS)
+    async handleFetchGroupChatRooms(@MessageBody() pagination: PaginationDto, @ConnectedSocket() client: Socket) {
+        try {
+            const userId = client.data.userId
+
+            const response = await this.groupChatService.getGroupChatRooms(userId, pagination)
+
+            // Join all group rooms
+            response.rooms.forEach(room => {
+                const groupRoomId = this.generateGroupRoomId(room.id)
+                client.join(groupRoomId)
+            })
+
+            this.server.to(this.generateUserRoomId(userId)).emit(EMIT_EVENTS.GROUP_CHAT_ROOMS, response)
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.FETCH_GROUP_MESSAGES)
+    async handleFetchGroupMessages(
+        @MessageBody() data: { groupChatRoomId: string; pagination: PaginationDto },
+        @ConnectedSocket() client: Socket
+    ) {
+        try {
+            const userId = client.data.userId
+
+            const response = await this.groupChatService.getGroupChatMessages(
+                data.groupChatRoomId,
+                userId,
+                data.pagination
+            )
+
+            this.server.to(this.generateUserRoomId(userId)).emit(EMIT_EVENTS.GROUP_MESSAGES, response)
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.ADD_GROUP_MEMBER)
+    async handleAddGroupMember(
+        @MessageBody() data: { groupChatRoomId: string; newMemberId: string },
+        @ConnectedSocket() client: Socket
+    ) {
+        try {
+            const userId = client.data.userId
+
+            const newMember = await this.groupChatService.addGroupMember(
+                data.groupChatRoomId,
+                userId,
+                data.newMemberId
+            )
+
+            const groupRoomId = this.generateGroupRoomId(data.groupChatRoomId)
+
+            // Notify all group members
+            this.server.to(groupRoomId).emit(EMIT_EVENTS.GROUP_MEMBER_ADDED, {
+                message: `${newMember.user.nick_name} was added to the group`,
+                newMember,
+                groupChatRoomId: data.groupChatRoomId
+            })
+
+            // Notify the new member
+            this.server.to(this.generateUserRoomId(data.newMemberId)).emit(EMIT_EVENTS.SUCCESS, {
+                message: "You've been added to a group",
+                groupChatRoomId: data.groupChatRoomId,
+                newMember
+            })
+
+            client.emit(EMIT_EVENTS.SUCCESS, {
+                message: "Member added successfully",
+                newMember
+            })
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.ADD_GROUP_MEMBERS)
+    async handleAddGroupMembers(
+        @MessageBody() data: { groupChatRoomId: string; memberIds: string[] },
+        @ConnectedSocket() client: Socket
+    ) {
+        try {
+            const userId = client.data.userId
+
+            const result = await this.groupChatService.addGroupMembers(
+                data.groupChatRoomId,
+                userId,
+                data.memberIds
+            )
+
+            const groupRoomId = this.generateGroupRoomId(data.groupChatRoomId)
+
+            // Notify all group members about the newly added members
+            result.members.forEach((newMember) => {
+                this.server.to(groupRoomId).emit(EMIT_EVENTS.GROUP_MEMBERS_ADDED, {
+                    message: `${newMember.user.nick_name} was added to the group`,
+                    newMember,
+                    groupChatRoomId: data.groupChatRoomId,
+                    addedCount: result.addedCount,
+                })
+
+                // Notify each new member individually
+                this.server.to(this.generateUserRoomId(newMember.user_id)).emit(EMIT_EVENTS.SUCCESS, {
+                    message: "You've been added to a group",
+                    groupChatRoomId: data.groupChatRoomId,
+                    newMember
+                })
+            })
+
+            client.emit(EMIT_EVENTS.SUCCESS, {
+                message: `${result.addedCount} member(s) added successfully`,
+                addedCount: result.addedCount,
+                alreadyMemberCount: result.alreadyMemberCount,
+                members: result.members
+            })
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.REMOVE_GROUP_MEMBER)
+    async handleRemoveGroupMember(
+        @MessageBody() data: { groupChatRoomId: string; memberId: string },
+        @ConnectedSocket() client: Socket
+    ) {
+        try {
+            const userId = client.data.userId
+
+            await this.groupChatService.removeGroupMember(
+                data.groupChatRoomId,
+                userId,
+                data.memberId
+            )
+
+            const groupRoomId = this.generateGroupRoomId(data.groupChatRoomId)
+            const memberUserRoomId = this.generateUserRoomId(data.memberId)
+
+            // Notify all group members that a member was removed
+            this.server.to(groupRoomId).emit(EMIT_EVENTS.GROUP_MEMBER_REMOVED, {
+                message: `Member was removed from the group`,
+                memberId: data.memberId,
+                removedBy: userId,
+                groupChatRoomId: data.groupChatRoomId
+            })
+
+            // Notify the removed member and remove them from the socket room
+            this.server.to(memberUserRoomId).emit(EMIT_EVENTS.GROUP_MEMBER_REMOVED, {
+                message: "You've been removed from a group",
+                groupChatRoomId: data.groupChatRoomId,
+                memberId: data.memberId
+            })
+
+            // Find and remove the specific user's sockets from the group room
+            const socketsInRoom = await this.server.in(groupRoomId).fetchSockets()
+            for (const socket of socketsInRoom) {
+                if (socket.data.userId === data.memberId) {
+                    socket.leave(groupRoomId)
+                }
+            }
+
+            client.emit(EMIT_EVENTS.SUCCESS, {
+                message: "Member removed successfully"
+            })
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.UPDATE_GROUP_CHAT)
+    async handleUpdateGroupChat(
+        @MessageBody() data: { groupChatRoomId: string; updateData: UpdateGroupChatRoomDto },
+        @ConnectedSocket() client: Socket
+    ) {
+        try {
+            const userId = client.data.userId
+
+            const updatedGroup = await this.groupChatService.updateGroupChatRoom(
+                data.groupChatRoomId,
+                userId,
+                data.updateData
+            )
+
+            const groupRoomId = this.generateGroupRoomId(data.groupChatRoomId)
+
+            // Notify all group members of the update
+            this.server.to(groupRoomId).emit(EMIT_EVENTS.GROUP_UPDATED, {
+                message: "Group information updated",
+                updatedGroup,
+                updatedBy: userId,
+                groupChatRoomId: data.groupChatRoomId
+            })
+
+            client.emit(EMIT_EVENTS.SUCCESS, {
+                message: "Group updated successfully",
+                updatedGroup
+            })
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.GROUP_TYPING)
+    async handleGroupTyping(
+        @MessageBody() data: { groupChatRoomId: string },
+        @ConnectedSocket() client: Socket
+    ) {
+        try {
+            const userId = client.data.userId
+            await this.groupChatService.ensureGroupMember(data.groupChatRoomId, userId)
+            const typingKey = `group-${data.groupChatRoomId}-${userId}`
+
+            // Add user to typing set
+            if (!this.userTypingStates.has(data.groupChatRoomId)) {
+                this.userTypingStates.set(data.groupChatRoomId, new Set())
+            }
+            this.userTypingStates.get(data.groupChatRoomId)!.add(userId)
+
+            const groupRoomId = this.generateGroupRoomId(data.groupChatRoomId)
+            const user = await this.userService.findUserById(userId)
+
+            // Notify all group members that this user is typing
+            client.broadcast.to(groupRoomId).emit(EMIT_EVENTS.GROUP_USER_TYPING, {
+                userId,
+                groupChatRoomId: data.groupChatRoomId,
+                user: user ? {
+                    id: user.id,
+                    nick_name: user.nick_name,
+                    avatar: user.avatar
+                } : null
+            })
+
+            this.setTypingTimeout(typingKey, () => {
+                this.userTypingStates.get(data.groupChatRoomId)?.delete(userId)
+                this.server.to(groupRoomId).emit(EMIT_EVENTS.GROUP_USER_STOPPED_TYPING, {
+                    userId,
+                    groupChatRoomId: data.groupChatRoomId
+                })
+            })
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+    }
+
+    @SubscribeMessage(SUBSCRIBED_EVENTS.GROUP_STOP_TYPING)
+    async handleGroupStopTyping(
+        @MessageBody() data: { groupChatRoomId: string },
+        @ConnectedSocket() client: Socket
+    ) {
+        try {
+            const userId = client.data.userId
+            await this.groupChatService.ensureGroupMember(data.groupChatRoomId, userId)
+
+            // Remove user from typing set
+            if (this.userTypingStates.has(data.groupChatRoomId)) {
+                this.userTypingStates.get(data.groupChatRoomId)!.delete(userId)
+            }
+            this.clearTypingTimeout(`group-${data.groupChatRoomId}-${userId}`)
+
+            const groupRoomId = this.generateGroupRoomId(data.groupChatRoomId)
+
+            // Notify all group members that this user stopped typing
+            client.broadcast.to(groupRoomId).emit(EMIT_EVENTS.GROUP_USER_STOPPED_TYPING, {
+                userId,
+                groupChatRoomId: data.groupChatRoomId
+            })
+        } catch (err: any) {
+            console.log(err)
+            throw new WsException({ message: err.message })
+        }
+    }
+
+}

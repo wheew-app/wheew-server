@@ -1,0 +1,10 @@
+import * as Prisma from './internal/prismaNamespaceBrowser.js';
+export { Prisma };
+export * as $Enums from './enums.js';
+export * from './enums.js';
+export type User = Prisma.UserModel;
+export type ChatRoom = Prisma.ChatRoomModel;
+export type Chat = Prisma.ChatModel;
+export type BlockList = Prisma.BlockListModel;
+export type SitePolicy = Prisma.SitePolicyModel;
+export type BlackListedWord = Prisma.BlackListedWordModel;
